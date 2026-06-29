@@ -1,0 +1,54 @@
+# dms-screenshot-plus — example configuration
+#
+# Copy to:  $XDG_CONFIG_HOME/dms-screenshot-plus/config   (usually ~/.config/dms-screenshot-plus/config)
+# This file is sourced as plain shell. Every value here is also accepted as an
+# environment variable, so you can override per-invocation without editing it.
+#
+# Uncomment and edit only what you want to change — sensible defaults apply.
+
+# --- Where "save to disk" writes -------------------------------------------
+# Defaults to "<Pictures>/Screenshots" (Pictures resolved via xdg-user-dir).
+# DSP_SAVE_DIR="$HOME/Pictures/Screenshots"
+
+# --- In-RAM staging dir (tmpfs; captures live here until you act on them) ---
+# DSP_MEM_DIR="$XDG_RUNTIME_DIR/dms-screenshot-plus"
+
+# --- UI language: auto | zh | en  (auto follows your locale) ----------------
+# DSP_LANG="auto"
+
+# --- Menu renderer: auto | fuzzel | wofi | rofi | bemenu | fzf | term -------
+# DSP_MENU_BACKEND="auto"
+
+# --- Freeze the screen while selecting a region (needs hyprpicker) ----------
+# DSP_FREEZE="yes"
+
+# --- Shutter sound ----------------------------------------------------------
+# DSP_PLAY_SOUND="yes"
+# DSP_SHUTTER_SOUND="/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"
+
+# --- External tools ---------------------------------------------------------
+# DSP_EDITOR_CMD="satty"     # annotation editor (called with --filename ...)
+# DSP_IMAGE_VIEWER="imv"     # used to pin a screenshot on top
+
+# --- Filename timestamp format (date(1)) ------------------------------------
+# DSP_FILENAME_FMT="%Y-%m-%d_%H-%M-%S"
+
+# --- OCR --------------------------------------------------------------------
+# Backend: auto | rapidocr | tesseract | custom
+# DSP_OCR_BACKEND="auto"
+# Path to a python that can `import rapidocr_onnxruntime` (auto-detected if empty)
+# DSP_OCR_PYTHON="$HOME/.local/share/rapidocr-venv/bin/python"
+# tesseract language packs (when using the tesseract backend)
+# DSP_OCR_TESS_LANGS="chi_sim+eng"
+# Optional: override RapidOCR's bundled PP-OCRv3 models with your own .onnx
+# (e.g. PP-OCRv4/v5 or another language). Leave empty to use the bundled set.
+# DSP_OCR_DET_MODEL="$HOME/.local/share/rapidocr-models/det.onnx"
+# DSP_OCR_REC_MODEL="$HOME/.local/share/rapidocr-models/rec.onnx"
+# DSP_OCR_CLS_MODEL="$HOME/.local/share/rapidocr-models/cls.onnx"
+# Fully custom OCR command; the image path is appended as the final argument,
+# and recognised text must be printed to stdout. Overrides backend selection.
+# DSP_OCR_CMD="my-ocr --stdout"
+
+# --- Scrolling capture ------------------------------------------------------
+# Command whose final argument is the output PNG path.
+# DSP_SCROLL_CMD="wayscrollshot --no-border -w 400 -o"

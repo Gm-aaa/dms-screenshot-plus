@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Screenshot Plus
+Name[zh_CN]=截图增强
+Comment=Menu-driven Wayland screenshot toolkit (region / fullscreen / OCR / scrolling)
+Comment[zh_CN]=菜单式 Wayland 截图工具（区域 / 全屏 / OCR / 滚动）
+Exec=dms-screenshot-plus
+Icon=applets-screenshooter
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;ocr;scroll;region;

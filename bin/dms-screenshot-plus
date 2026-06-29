@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# dms-screenshot-plus
+# ------------------------------------------------------------------------------
+# A polished, menu-driven Wayland screenshot toolkit for tiling compositors
+# (niri / Hyprland / Sway / wlroots). One launcher, four capture modes:
+#
+#   • Region      — freeze the screen, select an area, capture to RAM.
+#   • Fullscreen  — capture the focused / chosen output (or every output).
+#   • OCR         — select a region, extract text, copy it to the clipboard.
+#   • Scrolling   — stitch a long screenshot via wayscrollshot.
+#
+# Captures land in tmpfs (never touch the disk) until you choose what to do
+# with them from a single 6-action notification: copy path / copy image /
+# save to disk / open folder / annotate / pin-on-top.
+#
+# Design goals: zero hardcoded paths (XDG + config file + env overrides),
+# graceful dependency degradation, bilingual UI (zh / en), and a GUI menu
+# rendered through fuzzel/wofi/rofi/bemenu (with an fzf/terminal fallback).
+#
+# Usage:   dms-screenshot-plus [menu|region|fullscreen|ocr|scroll]
+# Help:    dms-screenshot-plus -h
+#
+# SPDX-License-Identifier: MIT
+# ==============================================================================
+
+set -Eeuo pipefail
+
+APP_NAME="dms-screenshot-plus"
+APP_VERSION="0.1.0"
+
+# ------------------------------------------------------------------------------
+# Diagnostics
+# ------------------------------------------------------------------------------
+# DSP_DEBUG=1 dms-screenshot-plus ...  -> full trace to $XDG_RUNTIME_DIR log
+if [[ -n "${DSP_DEBUG:-}" ]]; then
+    _dbg_log="${XDG_RUNTIME_DIR:-/tmp}/${APP_NAME}.log"
+    exec 2>>"$_dbg_log"
+    set -x
+fi
+
+die() { notify "${1:-error}"; printf '%s: %s\n' "$APP_NAME" "${1:-error}" >&2; exit 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+# Precedence (low -> high): built-in defaults < config file < environment.
+# Config file: $XDG_CONFIG_HOME/dms-screenshot-plus/config  (sourced as shell).
+# Every knob below is also an environment variable, so nothing is hardcoded.
+# ------------------------------------------------------------------------------
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+CONFIG_DIR="$XDG_CONFIG_HOME/$APP_NAME"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# Resolve the user's Pictures directory without assuming a fixed name.
+_default_pictures() {
+    local p=""
+    has xdg-user-dir && p="$(xdg-user-dir PICTURES 2>/dev/null || true)"
+    [[ -n "$p" && "$p" != "$HOME" ]] || p="$HOME/Pictures"
+    printf '%s' "$p"
+}
+
+# --- defaults (only set if not already provided by the environment) -----------
+: "${DSP_SAVE_DIR:=$(_default_pictures)/Screenshots}"
+: "${DSP_MEM_DIR:=$XDG_RUNTIME_DIR/$APP_NAME}"
+: "${DSP_LANG:=auto}"                  # auto | zh | en
+: "${DSP_MENU_BACKEND:=auto}"          # auto | fuzzel | wofi | rofi | bemenu | fzf | term
+: "${DSP_FREEZE:=yes}"                 # freeze the screen while selecting (hyprpicker)
+: "${DSP_PLAY_SOUND:=yes}"
+: "${DSP_SHUTTER_SOUND:=/usr/share/sounds/freedesktop/stereo/camera-shutter.oga}"
+: "${DSP_NOTIFY_TIMEOUT:=3000}"        # ms, for transient confirmations
+: "${DSP_EDITOR_CMD:=satty}"           # annotation editor; receives --filename
+: "${DSP_IMAGE_VIEWER:=imv}"           # used to pin a shot on top
+: "${DSP_FILENAME_FMT:=%Y-%m-%d_%H-%M-%S}"  # date(1) format for filenames
+# --- OCR ----------------------------------------------------------------------
+: "${DSP_OCR_BACKEND:=auto}"           # auto | rapidocr | tesseract | custom
+: "${DSP_OCR_PYTHON:=}"                # python interpreter that can import rapidocr
+: "${DSP_OCR_TESS_LANGS:=chi_sim+eng}" # tesseract -l value
+: "${DSP_OCR_CMD:=}"                   # custom: command, image path appended as last arg
+# Optional custom RapidOCR ONNX models (override the pip-bundled PP-OCRv3 set).
+: "${DSP_OCR_DET_MODEL:=}"             # text-detection model (.onnx)
+: "${DSP_OCR_REC_MODEL:=}"             # text-recognition model (.onnx)
+: "${DSP_OCR_CLS_MODEL:=}"             # angle-classification model (.onnx)
+# --- Scrolling ----------------------------------------------------------------
+: "${DSP_SCROLL_CMD:=wayscrollshot --no-border -w 400 -o}"  # output path appended last
+
+# Load the user config last-ish so it can override defaults but env still wins
+# for anything the user exported explicitly is handled by re-exporting below.
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+mkdir -p "$DSP_MEM_DIR"
+
+# ------------------------------------------------------------------------------
+# Internationalisation
+# ------------------------------------------------------------------------------
+_resolve_lang() {
+    case "$DSP_LANG" in
+        zh|en) printf '%s' "$DSP_LANG" ;;
+        *) case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in
+               zh_*|zh) printf 'zh' ;;
+               *)       printf 'en' ;;
+           esac ;;
+    esac
+}
+DSP_UI_LANG="$(_resolve_lang)"
+
+# msg <key> [printf-args...]
+msg() {
+    local k="$1"; shift || true
+    local zh en
+    case "$k" in
+        app_title)        zh="截图 Screenshot";        en="Screenshot" ;;
+        menu_region)      zh="区域截图";               en="Region" ;;
+        menu_fullscreen)  zh="全屏 / 显示器截图";       en="Fullscreen / Output" ;;
+        menu_ocr)         zh="OCR 文字提取";           en="OCR text extraction" ;;
+        menu_scroll)      zh="滚动截图";               en="Scrolling capture" ;;
+        title_main)       zh="截图";                   en="Screenshot" ;;
+        title_output)     zh="选择显示器";             en="Select output" ;;
+        output_all)       zh="全部显示器";             en="All outputs" ;;
+        act_copy_path)    zh="复制路径";               en="Copy path" ;;
+        act_copy_image)   zh="复制图片";               en="Copy image" ;;
+        act_save)         zh="写入磁盘";               en="Save to disk" ;;
+        act_open_dir)     zh="打开目录";               en="Open folder" ;;
+        act_edit)         zh="编辑";                   en="Annotate" ;;
+        act_pin)          zh="钉住置顶";               en="Pin on top" ;;
+        n_captured)       zh="截图已捕获（路径已复制）"; en="Captured (path copied)" ;;
+        n_captured_body)  zh="选择下一步：";           en="Choose next action:" ;;
+        n_copied_path)    zh="已复制路径";             en="Path copied" ;;
+        n_copied_image)   zh="已复制图片";             en="Image copied" ;;
+        n_copied_image_b) zh="可直接粘贴原图";         en="Paste the original image anywhere" ;;
+        n_saved)          zh="已写入磁盘";             en="Saved to disk" ;;
+        n_canceled)       zh="已取消";                 en="Canceled" ;;
+        n_failed)         zh="失败";                   en="Failed" ;;
+        n_no_region)      zh="未选择区域";             en="No region selected" ;;
+        ocr_title)        zh="OCR 文字提取";           en="OCR" ;;
+        ocr_ok)           zh="提取成功，已复制到剪贴板"; en="Extracted, copied to clipboard" ;;
+        ocr_empty)        zh="未识别到文字";           en="No text recognised" ;;
+        ocr_no_backend)   zh="未找到 OCR 引擎";         en="No OCR backend found" ;;
+        ocr_no_backend_b) zh="安装 rapidocr 或 tesseract，或设置 DSP_OCR_CMD";
+                          en="Install rapidocr or tesseract, or set DSP_OCR_CMD" ;;
+        scroll_canceled)  zh="滚动截图已取消或失败";    en="Scrolling capture canceled or failed" ;;
+        err_dep)          zh="缺少依赖：%s";           en="Missing dependency: %s" ;;
+        err_no_grim)      zh="grim 截图失败";          en="grim failed to capture" ;;
+        *)                zh="$k";                     en="$k" ;;
+    esac
+    local tmpl; [[ "$DSP_UI_LANG" == zh ]] && tmpl="$zh" || tmpl="$en"
+    # shellcheck disable=SC2059
+    printf "$tmpl" "$@"
+}
+
+# ------------------------------------------------------------------------------
+# Notifications
+# ------------------------------------------------------------------------------
+notify() {
+    has notify-send || return 0
+    local timeout="$DSP_NOTIFY_TIMEOUT" icon=""
+    [[ "${1:-}" == "-t" ]] && { timeout="$2"; shift 2; }
+    [[ "${1:-}" == "-i" ]] && { icon="$2"; shift 2; }
+    if [[ -n "$icon" ]]; then
+        notify-send -a "$(msg app_title)" -t "$timeout" -i "$icon" "$1" "${2:-}"
+    else
+        notify-send -a "$(msg app_title)" -t "$timeout" "$1" "${2:-}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Menu backend (GUI dmenu-style picker with graceful fallbacks)
+# ------------------------------------------------------------------------------
+_pick_menu_backend() {
+    local pref="${DSP_MENU_BACKEND,,}"
+    case "$pref" in
+        fuzzel|wofi|rofi|bemenu|fzf|term)
+            if [[ "$pref" == term ]] || has "$pref"; then printf '%s' "$pref"; return; fi ;;
+    esac
+    # auto: prefer a real terminal picker when run interactively, else GUI.
+    if [[ -t 0 ]] && [[ "$(tty 2>/dev/null || true)" == /dev/pts/* ]]; then
+        has fzf && { printf 'fzf'; return; }
+        printf 'term'; return
+    fi
+    local b
+    for b in fuzzel wofi rofi bemenu; do has "$b" && { printf '%s' "$b"; return; }; done
+    printf 'none'
+}
+
+# menu_pick <title> <item...>  -> prints chosen item, returns 130 on cancel
+menu_pick() {
+    local title="${1:-Select}"; shift
+    local items=("$@")
+    ((${#items[@]})) || return 130
+    local backend sel rc=130
+    backend="$(_pick_menu_backend)"
+    case "$backend" in
+        fuzzel) set +e; sel="$(printf '%s\n' "${items[@]}" | fuzzel --dmenu -p "$title")"; rc=$?; set -e ;;
+        wofi)   set +e; sel="$(printf '%s\n' "${items[@]}" | wofi --dmenu --prompt "$title")"; rc=$?; set -e ;;
+        rofi)   set +e; sel="$(printf '%s\n' "${items[@]}" | rofi -dmenu -p "$title")"; rc=$?; set -e ;;
+        bemenu) set +e; sel="$(printf '%s\n' "${items[@]}" | bemenu -p "$title")"; rc=$?; set -e ;;
+        fzf)    set +e; sel="$(printf '%s\n' "${items[@]}" | fzf --prompt "$title > " --layout=reverse --height=40% --border)"; rc=$?; set -e ;;
+        term)
+            printf '%s\n' "$title" >&2
+            local i=1 it
+            for it in "${items[@]}"; do printf '  %d) %s\n' "$i" "$it" >&2; ((i++)); done
+            printf '> ' >&2
+            local idx; set +e; read -r idx; rc=$?; set -e
+            if [[ $rc -eq 0 && "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=${#items[@]} )); then
+                sel="${items[$((idx-1))]}"; rc=0
+            else rc=130; fi ;;
+        none) return 130 ;;
+    esac
+    [[ $rc -ne 0 || -z "${sel:-}" ]] && return 130
+    printf '%s' "${sel//$'\r'/}"
+}
+
+# ------------------------------------------------------------------------------
+# Compositor abstraction: enumerate outputs (monitors)
+# ------------------------------------------------------------------------------
+list_outputs() {
+    if   has niri    && has jq; then niri msg -j outputs 2>/dev/null | jq -r 'keys[]'
+    elif has niri;             then niri msg outputs 2>/dev/null | awk -F'[()]' '/^Output/{print $2}'
+    elif has hyprctl && has jq; then hyprctl monitors -j 2>/dev/null | jq -r '.[].name'
+    elif has swaymsg && has jq; then swaymsg -t get_outputs 2>/dev/null | jq -r '.[].name'
+    elif has wlr-randr;        then wlr-randr 2>/dev/null | awk '/^[^ ]/{print $1}'
+    fi | awk 'NF>0{print $1}' | sort -u || true
+}
+
+# ------------------------------------------------------------------------------
+# Capture primitives
+# ------------------------------------------------------------------------------
+_freeze_pid=""
+freeze_start() {
+    [[ "${DSP_FREEZE,,}" == yes ]] || return 0
+    has hyprpicker || return 0
+    hyprpicker -r -z -q & _freeze_pid=$!
+    sleep 0.2   # let the frozen layer map before slurp draws on it
+}
+freeze_stop() { [[ -n "$_freeze_pid" ]] && kill "$_freeze_pid" 2>/dev/null || true; _freeze_pid=""; }
+
+# select_region [slurp-args...] -> prints geometry, returns 1 on cancel/Esc
+select_region() {
+    has slurp || die "$(msg err_dep "slurp")"
+    local geom
+    freeze_start
+    if geom="$(slurp "$@")"; then
+        printf '%s' "$geom"; return 0
+    fi
+    freeze_stop
+    return 1
+}
+
+play_shutter() {
+    [[ "${DSP_PLAY_SOUND,,}" == yes ]] || return 0
+    [[ -r "$DSP_SHUTTER_SOUND" ]] || return 0
+    has pw-play && pw-play "$DSP_SHUTTER_SOUND" >/dev/null 2>&1 &
+    return 0
+}
+
+new_tmp_png() {
+    # Keep only the latest in-RAM shot; clear stragglers from the last run.
+    rm -f "$DSP_MEM_DIR"/*.png 2>/dev/null || true
+    printf '%s' "$DSP_MEM_DIR/$(date +"$DSP_FILENAME_FMT").png"
+}
+
+# ------------------------------------------------------------------------------
+# Shared post-capture handler — one notification, six actions.
+# Default action (no click / timeout): the path is already on the clipboard.
+# post_capture_image <png>
+# ------------------------------------------------------------------------------
+post_capture_image() {
+    local tmp="$1"
+    [[ -s "$tmp" ]] || { notify "$(msg n_failed)" "$(msg err_no_grim)"; return 1; }
+
+    play_shutter
+    printf '%s' "$tmp" | wl-copy   # path-first: clipboard is useful even if ignored
+
+    local action
+    action="$(notify-send -a "$(msg app_title)" \
+        -i "$tmp" \
+        -A "path=$(msg act_copy_path)" \
+        -A "image=$(msg act_copy_image)" \
+        -A "save=$(msg act_save)" \
+        -A "dir=$(msg act_open_dir)" \
+        -A "edit=$(msg act_edit)" \
+        -A "pin=$(msg act_pin)" \
+        "$(msg n_captured)" "$(msg n_captured_body)")" || action=""
+
+    local base ts dest
+    base="$(basename "$tmp")"; ts="${base%.png}"
+
+    case "$action" in
+        path)
+            notify -t 2000 "$(msg n_copied_path)" "$tmp" ;;
+        image)
+            wl-copy --type image/png < "$tmp"
+            notify -t 2000 -i "$tmp" "$(msg n_copied_image)" "$(msg n_copied_image_b)" ;;
+        save)
+            mkdir -p "$DSP_SAVE_DIR"
+            dest="$DSP_SAVE_DIR/$base"
+            mv "$tmp" "$dest"
+            printf '%s' "$dest" | wl-copy
+            notify -t 3000 -i "$dest" "$(msg n_saved)" "$dest" ;;
+        dir)
+            # Reveal-and-select via the freedesktop FileManager1 D-Bus API,
+            # falling back to just opening the containing folder.
+            { gdbus call --session --dest org.freedesktop.FileManager1 \
+                --object-path /org/freedesktop/FileManager1 \
+                --method org.freedesktop.FileManager1.ShowItems \
+                "['file://$tmp']" "" >/dev/null 2>&1 \
+                || gio open "$(dirname "$tmp")" >/dev/null 2>&1; } & ;;
+        edit)
+            mkdir -p "$DSP_SAVE_DIR"
+            # shellcheck disable=SC2086
+            $DSP_EDITOR_CMD --filename "$tmp" \
+                --output-filename "$DSP_SAVE_DIR/$ts-edited.png" \
+                --copy-command wl-copy >/dev/null 2>&1 & ;;
+        pin)
+            # Copy out of the auto-cleared mem dir so the next shot won't delete it.
+            local pindir="$DSP_MEM_DIR/pinned" pinimg
+            mkdir -p "$pindir"
+            pinimg="$pindir/pinned-shot-$ts.png"
+            cp "$tmp" "$pinimg"
+            # shellcheck disable=SC2086
+            $DSP_IMAGE_VIEWER "$pinimg" >/dev/null 2>&1 & ;;
+        *) : ;;  # dismissed / timed out: path already on clipboard
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Modes
+# ------------------------------------------------------------------------------
+mode_region() {
+    has grim || die "$(msg err_dep "grim")"
+    local geom tmp
+    geom="$(select_region)" || exit 0   # Esc -> silent cancel
+    tmp="$(new_tmp_png)"
+    grim -g "$geom" "$tmp" || { freeze_stop; notify "$(msg n_failed)" "$(msg err_no_grim)"; exit 1; }
+    freeze_stop
+    post_capture_image "$tmp"
+}
+
+mode_fullscreen() {
+    has grim || die "$(msg err_dep "grim")"
+    local -a outs; mapfile -t outs < <(list_outputs)
+    local tmp; tmp="$(new_tmp_png)"
+    if (( ${#outs[@]} > 1 )); then
+        local pick; pick="$(menu_pick "$(msg title_output)" "$(msg output_all)" "${outs[@]}")" || exit 0
+        if [[ "$pick" == "$(msg output_all)" ]]; then grim "$tmp"
+        else grim -o "$pick" "$tmp"; fi
+    elif (( ${#outs[@]} == 1 )); then
+        grim -o "${outs[0]}" "$tmp"
+    else
+        grim "$tmp"
+    fi
+    post_capture_image "$tmp"
+}
+
+mode_scroll() {
+    has wayscrollshot || die "$(msg err_dep "wayscrollshot")"
+    local tmp; tmp="$(new_tmp_png)"
+    # DSP_SCROLL_CMD is a command whose final argument is the output path.
+    # shellcheck disable=SC2086
+    if ! $DSP_SCROLL_CMD "$tmp"; then
+        notify -t 2000 "$(msg scroll_canceled)"; exit 0
+    fi
+    [[ -s "$tmp" ]] || exit 0
+    post_capture_image "$tmp"
+}
+
+# --- OCR ----------------------------------------------------------------------
+ocr_python_path() {
+    if [[ -n "$DSP_OCR_PYTHON" ]]; then
+        [[ -x "$DSP_OCR_PYTHON" ]] && { printf '%s' "$DSP_OCR_PYTHON"; return 0; }
+        return 1
+    fi
+    local cand="$HOME/.local/share/rapidocr-venv/bin/python"
+    if [[ -x "$cand" ]] && "$cand" -c 'import rapidocr_onnxruntime' 2>/dev/null; then
+        printf '%s' "$cand"; return 0
+    fi
+    if has python3 && python3 -c 'import rapidocr_onnxruntime' 2>/dev/null; then
+        printf 'python3'; return 0
+    fi
+    return 1
+}
+
+detect_ocr_backend() {
+    [[ -n "$DSP_OCR_CMD" ]] && { printf 'custom'; return; }
+    case "${DSP_OCR_BACKEND,,}" in
+        rapidocr)  printf 'rapidocr' ;;
+        tesseract) printf 'tesseract' ;;
+        custom)    printf 'custom' ;;
+        *)  if ocr_python_path >/dev/null; then printf 'rapidocr'
+            elif has tesseract;          then printf 'tesseract'
+            else printf 'none'; fi ;;
+    esac
+}
+
+run_ocr() {  # <image> -> text on stdout
+    local img="$1" backend; backend="$(detect_ocr_backend)"
+    case "$backend" in
+        rapidocr)
+            local py; py="$(ocr_python_path)" || return 1
+            # Export the optional model overrides so the interpreter can see them.
+            DSP_OCR_DET_MODEL="$DSP_OCR_DET_MODEL" \
+            DSP_OCR_REC_MODEL="$DSP_OCR_REC_MODEL" \
+            DSP_OCR_CLS_MODEL="$DSP_OCR_CLS_MODEL" \
+            "$py" - "$img" <<'PY' 2>/dev/null
+import sys, os, logging
+logging.disable(logging.CRITICAL)
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    kw = {"print_verbose": False}
+    for env, key in (("DSP_OCR_DET_MODEL", "det_model_path"),
+                     ("DSP_OCR_REC_MODEL", "rec_model_path"),
+                     ("DSP_OCR_CLS_MODEL", "cls_model_path")):
+        v = os.environ.get(env)
+        if v:
+            kw[key] = v
+    res, _ = RapidOCR(**kw)(sys.argv[1])
+    if res:
+        print('\n'.join(line[1] for line in res))
+except Exception:
+    pass
+PY
+            ;;
+        tesseract)
+            tesseract "$img" stdout -l "$DSP_OCR_TESS_LANGS" 2>/dev/null ;;
+        custom)
+            # shellcheck disable=SC2086
+            $DSP_OCR_CMD "$img" ;;
+        none) return 1 ;;
+    esac
+}
+
+mode_ocr() {
+    has grim || die "$(msg err_dep "grim")"
+    if [[ "$(detect_ocr_backend)" == none ]]; then
+        notify "$(msg ocr_no_backend)" "$(msg ocr_no_backend_b)"; exit 1
+    fi
+    local geom img
+    geom="$(select_region -d -c '#00000000' -b '#00000044')" || { notify -t 2000 "$(msg n_canceled)" "$(msg n_no_region)"; exit 0; }
+    img="$(mktemp "${TMPDIR:-/tmp}/dsp-ocr-XXXXXX.png")"
+    trap 'rm -f "$img"' EXIT
+    grim -g "$geom" "$img" || { freeze_stop; notify "$(msg n_failed)" "$(msg err_no_grim)"; exit 1; }
+    freeze_stop
+
+    local text
+    text="$(run_ocr "$img" | sed 's/[[:space:]]*$//' | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba}')"
+    if [[ -n "$text" ]]; then
+        printf '%s' "$text" | wl-copy
+        notify "$(msg ocr_ok)" "$text"
+    else
+        notify "$(msg ocr_title)" "$(msg ocr_empty)"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Top-level menu
+# ------------------------------------------------------------------------------
+show_menu() {
+    local L_REGION L_FULL L_OCR L_SCROLL pick
+    L_REGION="$(msg menu_region)"
+    L_FULL="$(msg menu_fullscreen)"
+    L_OCR="$(msg menu_ocr)"
+    L_SCROLL="$(msg menu_scroll)"
+    pick="$(menu_pick "$(msg title_main)" "$L_REGION" "$L_FULL" "$L_OCR" "$L_SCROLL")" || exit 0
+    case "$pick" in
+        "$L_REGION") mode_region ;;
+        "$L_FULL")   mode_fullscreen ;;
+        "$L_OCR")    mode_ocr ;;
+        "$L_SCROLL") mode_scroll ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+$APP_NAME $APP_VERSION — menu-driven Wayland screenshot toolkit
+
+Usage:
+  $APP_NAME [COMMAND]
+
+Commands:
+  menu                 Show the picker (default)
+  region               Select a region and capture
+  fullscreen | full    Capture an output (or all)
+  ocr                  Select a region and OCR it to the clipboard
+  scroll               Scrolling/long screenshot
+
+Options:
+  -h, --help           Show this help
+  -v, --version        Show version
+      --print-config   Print the effective configuration
+
+Configuration:
+  Config file: $CONFIG_FILE  (sourced shell, optional)
+  All DSP_* settings are overridable via environment variables.
+  Run '$APP_NAME --print-config' to see current values.
+EOF
+}
+
+print_config() {
+    local v
+    for v in DSP_SAVE_DIR DSP_MEM_DIR DSP_LANG DSP_MENU_BACKEND DSP_FREEZE \
+             DSP_PLAY_SOUND DSP_SHUTTER_SOUND DSP_NOTIFY_TIMEOUT DSP_EDITOR_CMD \
+             DSP_IMAGE_VIEWER DSP_FILENAME_FMT DSP_OCR_BACKEND DSP_OCR_PYTHON \
+             DSP_OCR_TESS_LANGS DSP_OCR_CMD DSP_OCR_DET_MODEL DSP_OCR_REC_MODEL \
+             DSP_OCR_CLS_MODEL DSP_SCROLL_CMD; do
+        printf '%-22s = %s\n' "$v" "${!v}"
+    done
+    printf '%-22s = %s\n' "(resolved UI lang)" "$DSP_UI_LANG"
+    printf '%-22s = %s\n' "(menu backend)" "$(_pick_menu_backend)"
+    printf '%-22s = %s\n' "(OCR backend)" "$(detect_ocr_backend)"
+}
+
+main() {
+    case "${1:-menu}" in
+        menu|"")            show_menu ;;
+        region|area)        mode_region ;;
+        fullscreen|full|output) mode_fullscreen ;;
+        ocr)                mode_ocr ;;
+        scroll|scrolling)   mode_scroll ;;
+        -h|--help|help)     usage ;;
+        -v|--version)       printf '%s %s\n' "$APP_NAME" "$APP_VERSION" ;;
+        --print-config)     print_config ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

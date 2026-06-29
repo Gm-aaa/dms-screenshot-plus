@@ -1,0 +1,11 @@
+# Local, machine-specific config (ship config.example instead)
+/config
+config.local
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+
+# Runtime captures should never live in the repo
+*.png
