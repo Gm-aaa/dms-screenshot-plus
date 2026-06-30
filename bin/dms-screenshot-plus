@@ -196,7 +196,7 @@ menu_pick() {
     local backend sel rc=130
     backend="$(_pick_menu_backend)"
     case "$backend" in
-        fuzzel) set +e; sel="$(printf '%s\n' "${items[@]}" | fuzzel --dmenu -p "$title")"; rc=$?; set -e ;;
+        fuzzel) set +e; sel="$(printf '%s\n' "${items[@]}" | fuzzel --dmenu --auto-select -p "$title")"; rc=$?; set -e ;;
         wofi)   set +e; sel="$(printf '%s\n' "${items[@]}" | wofi --dmenu --prompt "$title")"; rc=$?; set -e ;;
         rofi)   set +e; sel="$(printf '%s\n' "${items[@]}" | rofi -dmenu -p "$title")"; rc=$?; set -e ;;
         bemenu) set +e; sel="$(printf '%s\n' "${items[@]}" | bemenu -p "$title")"; rc=$?; set -e ;;
@@ -231,14 +231,26 @@ list_outputs() {
 # ------------------------------------------------------------------------------
 # Capture primitives
 # ------------------------------------------------------------------------------
-_freeze_pid=""
+# The freeze layer's PID is tracked through a file, not a shell variable:
+# select_region() runs inside a command substitution (a subshell), so a
+# variable set there never reaches the caller's freeze_stop. A file does.
+_freeze_pidfile="$DSP_MEM_DIR/.freeze.pid"
 freeze_start() {
     [[ "${DSP_FREEZE,,}" == yes ]] || return 0
     has hyprpicker || return 0
-    hyprpicker -r -z -q & _freeze_pid=$!
+    # Detach stdout/stderr. Without this, hyprpicker inherits the parent
+    # command-substitution pipe and holds it open, so $(select_region) cannot
+    # return until hyprpicker exits — which only happens on an extra click.
+    hyprpicker -r -z -q >/dev/null 2>&1 &
+    printf '%s' "$!" > "$_freeze_pidfile"
     sleep 0.2   # let the frozen layer map before slurp draws on it
 }
-freeze_stop() { [[ -n "$_freeze_pid" ]] && kill "$_freeze_pid" 2>/dev/null || true; _freeze_pid=""; }
+freeze_stop() {
+    [[ -f "$_freeze_pidfile" ]] || return 0
+    local pid; pid="$(cat "$_freeze_pidfile" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    rm -f "$_freeze_pidfile"
+}
 
 # select_region [slurp-args...] -> prints geometry, returns 1 on cancel/Esc
 select_region() {
@@ -441,7 +453,7 @@ mode_ocr() {
         notify "$(msg ocr_no_backend)" "$(msg ocr_no_backend_b)"; exit 1
     fi
     local geom img
-    geom="$(select_region -d -c '#00000000' -b '#00000044')" || { notify -t 2000 "$(msg n_canceled)" "$(msg n_no_region)"; exit 0; }
+    geom="$(select_region)" || { notify -t 2000 "$(msg n_canceled)" "$(msg n_no_region)"; exit 0; }
     img="$(mktemp "${TMPDIR:-/tmp}/dsp-ocr-XXXXXX.png")"
     trap 'rm -f "$img"' EXIT
     grim -g "$geom" "$img" || { freeze_stop; notify "$(msg n_failed)" "$(msg err_no_grim)"; exit 1; }
@@ -462,10 +474,12 @@ mode_ocr() {
 # ------------------------------------------------------------------------------
 show_menu() {
     local L_REGION L_FULL L_OCR L_SCROLL pick
-    L_REGION="$(msg menu_region)"
-    L_FULL="$(msg menu_fullscreen)"
-    L_OCR="$(msg menu_ocr)"
-    L_SCROLL="$(msg menu_scroll)"
+    # Numbered prefixes let a single digit keystroke narrow fuzzel to one
+    # match, which --auto-select then confirms immediately (no Enter needed).
+    L_REGION="1 $(msg menu_region)"
+    L_FULL="2 $(msg menu_fullscreen)"
+    L_OCR="3 $(msg menu_ocr)"
+    L_SCROLL="4 $(msg menu_scroll)"
     pick="$(menu_pick "$(msg title_main)" "$L_REGION" "$L_FULL" "$L_OCR" "$L_SCROLL")" || exit 0
     case "$pick" in
         "$L_REGION") mode_region ;;
