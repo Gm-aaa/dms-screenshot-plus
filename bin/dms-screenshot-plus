@@ -177,6 +177,12 @@ msg() {
         lang_en)          zh="English";                en="English" ;;
         set_back)         zh="返回";                   en="Back" ;;
         set_lang_changed) zh="语言已切换";             en="Language changed" ;;
+        set_keybind)      zh="快捷键";                 en="Keybinding" ;;
+        kb_copied)        zh="键位片段已复制 (%s)";     en="Keybinding snippet copied (%s)" ;;
+        kb_shown)         zh="键位片段 (%s)";           en="Keybinding snippet (%s)" ;;
+        kb_paste)         zh="贴到 %s";                 en="Paste into %s" ;;
+        kb_niri_hint)     zh="（放进 binds { } 块内）";  en="(inside the binds { } block)" ;;
+        kb_generic_target) zh="你的合成器配置文件";      en="your compositor config file" ;;
         *)                zh="$k";                     en="$k" ;;
     esac
     local tmpl; [[ "$DSP_UI_LANG" == zh ]] && tmpl="$zh" || tmpl="$en"
@@ -598,19 +604,65 @@ settings_language() {
     notify -t 2000 "$(msg set_lang_changed)"
 }
 
+# _keybind_self — the command to place in a keybind: the bare name when it is
+# on $PATH (the usual install), else this script's absolute path.
+_keybind_self() {
+    has "$APP_NAME" && { printf '%s' "$APP_NAME"; return; }
+    printf '%s' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+}
+
+# settings_keybind — detect the running compositor, build the matching keybind
+# snippet (default Mod+F1), copy it to the clipboard and show it. Never edits
+# any config file — the user pastes it where they want.
+settings_keybind() {
+    local self comp snippet target
+    self="$(_keybind_self)"
+    # Detect the *running* compositor from its env socket — more reliable than
+    # checking whether a binary happens to be installed.
+    if   [[ -n "${NIRI_SOCKET:-}" ]];                 then comp=niri
+    elif [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then comp=hyprland
+    elif [[ -n "${SWAYSOCK:-}" ]];                    then comp=sway
+    else comp=generic; fi
+
+    case "$comp" in
+        niri)
+            snippet="Mod+F1 hotkey-overlay-title=\"$(msg app_title)\" { spawn \"$self\"; }"
+            target="~/.config/niri/config.kdl $(msg kb_niri_hint)" ;;
+        hyprland)
+            snippet="bind = SUPER, F1, exec, $self"
+            target="~/.config/hypr/hyprland.conf" ;;
+        sway)
+            snippet="bindsym \$mod+F1 exec $self"
+            target="~/.config/sway/config" ;;
+        *)
+            comp="niri / hyprland / sway"
+            snippet="# niri:"$'\n'"Mod+F1 { spawn \"$self\"; }"$'\n'"# hyprland:"$'\n'"bind = SUPER, F1, exec, $self"$'\n'"# sway:"$'\n'"bindsym \$mod+F1 exec $self"
+            target="$(msg kb_generic_target)" ;;
+    esac
+
+    local body="$snippet"$'\n\n'"$(msg kb_paste "$target")"
+    if printf '%s' "$snippet" | clip; then
+        notify -t 6000 "$(msg kb_copied "$comp")" "$body"
+    else
+        notify -t 8000 "$(msg kb_shown "$comp")" "$body"
+    fi
+}
+
 # mode_settings — settings submenu; loops until Back/cancel.
 mode_settings() {
     while true; do
-        local L_LANG L_BACK pick cur_key
+        local L_LANG L_KEYBIND L_BACK pick cur_key
         # DSP_LANG may be auto|zh|en; anything else is treated as auto.
         case "$DSP_LANG" in zh) cur_key=lang_zh ;; en) cur_key=lang_en ;; *) cur_key=lang_auto ;; esac
         L_LANG="1 $(msg set_language): $(msg "$cur_key")"
+        L_KEYBIND="2 $(msg set_keybind)"
         L_BACK="0 $(msg set_back)"
-        pick="$(menu_pick "$(msg title_settings)" "$L_LANG" "$L_BACK")" || return 0
+        pick="$(menu_pick "$(msg title_settings)" "$L_LANG" "$L_KEYBIND" "$L_BACK")" || return 0
         case "$pick" in
-            "$L_LANG") settings_language ;;
-            "$L_BACK") return 0 ;;
-            *)         return 0 ;;
+            "$L_LANG")    settings_language ;;
+            "$L_KEYBIND") settings_keybind ;;
+            "$L_BACK")    return 0 ;;
+            *)            return 0 ;;
         esac
     done
 }
