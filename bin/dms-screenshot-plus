@@ -160,6 +160,7 @@ msg() {
         ocr_title)        zh="OCR 文字提取";           en="OCR" ;;
         ocr_ok)           zh="提取成功，已复制到剪贴板"; en="Extracted, copied to clipboard" ;;
         ocr_empty)        zh="未识别到文字";           en="No text recognised" ;;
+        ocr_error)        zh="OCR 引擎异常（DSP_DEBUG=1 查看日志）"; en="OCR engine error (run with DSP_DEBUG=1 for logs)" ;;
         ocr_no_backend)   zh="未找到 OCR 引擎";         en="No OCR backend found" ;;
         ocr_no_backend_b) zh="安装 rapidocr 或 tesseract，或设置 DSP_OCR_CMD";
                           en="Install rapidocr or tesseract, or set DSP_OCR_CMD" ;;
@@ -474,11 +475,17 @@ run_ocr() {  # <image> -> text on stdout
     case "$backend" in
         rapidocr)
             local py; py="$(ocr_python_path)" || return 1
+            # Keep onnxruntime's C++ chatter quiet normally, but let real errors
+            # reach the debug log when DSP_DEBUG is set (fd 2 is the log then).
+            # An engine exception exits 3 so the caller can tell "it crashed"
+            # apart from "it ran and found no text" — the two used to look
+            # identical (silent) and were impossible to diagnose.
+            local errto=/dev/null; [[ -n "${DSP_DEBUG:-}" ]] && errto=/dev/stderr
             # Export the optional model overrides so the interpreter can see them.
             DSP_OCR_DET_MODEL="$DSP_OCR_DET_MODEL" \
             DSP_OCR_REC_MODEL="$DSP_OCR_REC_MODEL" \
             DSP_OCR_CLS_MODEL="$DSP_OCR_CLS_MODEL" \
-            "$py" - "$img" <<'PY' 2>/dev/null
+            "$py" - "$img" 2>"$errto" <<'PY'
 import sys, os, logging
 logging.disable(logging.CRITICAL)
 try:
@@ -493,8 +500,12 @@ try:
     res, _ = RapidOCR(**kw)(sys.argv[1])
     if res:
         print('\n'.join(line[1] for line in res))
+    else:
+        print("rapidocr: engine ran, no text detected", file=sys.stderr)
 except Exception:
-    pass
+    import traceback
+    traceback.print_exc()
+    sys.exit(3)   # engine error — distinct from a clean empty result
 PY
             ;;
         tesseract)
@@ -518,9 +529,16 @@ mode_ocr() {
     grim -g "$geom" "$img" || { freeze_stop; notify "$(msg n_failed)" "$(msg err_no_grim)"; exit 1; }
     freeze_stop
 
+    # Capture raw output and exit code separately so an engine crash (rc≠0) is
+    # distinguishable from a clean "no text" result. The pipeline that trims
+    # whitespace would otherwise mask run_ocr's exit code.
+    local raw rc=0
+    raw="$(run_ocr "$img")" || rc=$?
     local text
-    text="$(run_ocr "$img" | sed 's/[[:space:]]*$//' | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba}')"
-    if [[ -n "$text" ]]; then
+    text="$(printf '%s' "$raw" | sed 's/[[:space:]]*$//' | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba}')"
+    if (( rc != 0 )); then
+        notify "$(msg ocr_title)" "$(msg ocr_error)"
+    elif [[ -n "$text" ]]; then
         if printf '%s' "$text" | clip; then
             notify "$(msg ocr_ok)" "$text"
         else
