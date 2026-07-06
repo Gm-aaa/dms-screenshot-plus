@@ -147,6 +147,14 @@ msg() {
         scroll_canceled)  zh="滚动截图已取消或失败";    en="Scrolling capture canceled or failed" ;;
         err_dep)          zh="缺少依赖：%s";           en="Missing dependency: %s" ;;
         err_no_grim)      zh="grim 截图失败";          en="grim failed to capture" ;;
+        menu_settings)    zh="设置";                   en="Settings" ;;
+        title_settings)   zh="设置";                   en="Settings" ;;
+        set_language)     zh="语言";                   en="Language" ;;
+        lang_auto)        zh="自动（跟随系统）";        en="Auto (follow system)" ;;
+        lang_zh)          zh="中文";                   en="中文" ;;
+        lang_en)          zh="English";                en="English" ;;
+        set_back)         zh="返回";                   en="Back" ;;
+        set_lang_changed) zh="语言已切换";             en="Language changed" ;;
         *)                zh="$k";                     en="$k" ;;
     esac
     local tmpl; [[ "$DSP_UI_LANG" == zh ]] && tmpl="$zh" || tmpl="$en"
@@ -470,23 +478,98 @@ mode_ocr() {
 }
 
 # ------------------------------------------------------------------------------
+# Settings — persisted through the (shell-sourced) config file.
+# ------------------------------------------------------------------------------
+# config_set KEY VALUE — upsert `KEY="VALUE"` into $CONFIG_FILE atomically.
+# An existing *uncommented* assignment is replaced in place; otherwise the line
+# is appended. Commented example lines (e.g. copied from config.example) are
+# left untouched — they are ignored on source, and the appended/edited active
+# line wins.
+config_set() {
+    local key="$1" val="$2"
+    mkdir -p "$CONFIG_DIR"
+    local tmp; tmp="$(mktemp "$CONFIG_DIR/.config.XXXXXX")"
+    local line="$key=\"$val\""
+    if [[ -f "$CONFIG_FILE" ]] && grep -qE "^[[:space:]]*$key=" "$CONFIG_FILE"; then
+        # Replace the first uncommented assignment; keep everything else verbatim.
+        awk -v k="$key" -v repl="$line" '
+            !done && $0 ~ ("^[[:space:]]*" k "=") { print repl; done=1; next }
+            { print }
+        ' "$CONFIG_FILE" > "$tmp"
+    else
+        [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" > "$tmp"
+        printf '%s\n' "$line" >> "$tmp"
+    fi
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# settings_language — pick auto|zh|en, persist it, apply it live.
+settings_language() {
+    local cur="$DSP_LANG" mark_a="" mark_z="" mark_e=""
+    case "$cur" in
+        zh) mark_z="● " ;;
+        en) mark_e="● " ;;
+        *)  mark_a="● " ;;   # anything that isn't zh/en resolves as auto
+    esac
+    local A="${mark_a}$(msg lang_auto)" Z="${mark_z}$(msg lang_zh)" E="${mark_e}$(msg lang_en)"
+    local pick; pick="$(menu_pick "$(msg set_language)" "$A" "$Z" "$E")" || return 0
+    local val
+    case "$pick" in
+        "$A") val="auto" ;;
+        "$Z") val="zh" ;;
+        "$E") val="en" ;;
+        *)    return 0 ;;
+    esac
+    config_set DSP_LANG "$val"
+    DSP_LANG="$val"
+    DSP_UI_LANG="$(_resolve_lang)"
+    notify -t 2000 "$(msg set_lang_changed)"
+}
+
+# mode_settings — settings submenu; loops until Back/cancel.
+mode_settings() {
+    while true; do
+        local L_LANG L_BACK pick cur_key
+        # DSP_LANG may be auto|zh|en; anything else is treated as auto.
+        case "$DSP_LANG" in zh) cur_key=lang_zh ;; en) cur_key=lang_en ;; *) cur_key=lang_auto ;; esac
+        L_LANG="1 $(msg set_language): $(msg "$cur_key")"
+        L_BACK="0 $(msg set_back)"
+        pick="$(menu_pick "$(msg title_settings)" "$L_LANG" "$L_BACK")" || return 0
+        case "$pick" in
+            "$L_LANG") settings_language ;;
+            "$L_BACK") return 0 ;;
+            *)         return 0 ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
 # Top-level menu
 # ------------------------------------------------------------------------------
 show_menu() {
-    local L_REGION L_FULL L_OCR L_SCROLL pick
-    # Numbered prefixes let a single digit keystroke narrow fuzzel to one
-    # match, which --auto-select then confirms immediately (no Enter needed).
-    L_REGION="1 $(msg menu_region)"
-    L_FULL="2 $(msg menu_fullscreen)"
-    L_OCR="3 $(msg menu_ocr)"
-    L_SCROLL="4 $(msg menu_scroll)"
-    pick="$(menu_pick "$(msg title_main)" "$L_REGION" "$L_FULL" "$L_OCR" "$L_SCROLL")" || exit 0
-    case "$pick" in
-        "$L_REGION") mode_region ;;
-        "$L_FULL")   mode_fullscreen ;;
-        "$L_OCR")    mode_ocr ;;
-        "$L_SCROLL") mode_scroll ;;
-    esac
+    # Loop so the picker returns after a settings change, re-rendered in the
+    # (possibly new) language. Capture actions run their mode and exit.
+    while true; do
+        local L_REGION L_FULL L_OCR L_SCROLL L_SETTINGS pick
+        # Numbered prefixes let a single digit keystroke narrow fuzzel to one
+        # match, which --auto-select then confirms immediately (no Enter needed).
+        L_REGION="1 $(msg menu_region)"
+        L_FULL="2 $(msg menu_fullscreen)"
+        L_OCR="3 $(msg menu_ocr)"
+        L_SCROLL="4 $(msg menu_scroll)"
+        L_SETTINGS="5 $(msg menu_settings)"
+        pick="$(menu_pick "$(msg title_main)" \
+            "$L_REGION" "$L_FULL" "$L_OCR" "$L_SCROLL" "$L_SETTINGS")" || exit 0
+        case "$pick" in
+            "$L_REGION")   mode_region ;;
+            "$L_FULL")     mode_fullscreen ;;
+            "$L_OCR")      mode_ocr ;;
+            "$L_SCROLL")   mode_scroll ;;
+            "$L_SETTINGS") mode_settings; continue ;;  # back to menu, new lang
+            *)             exit 0 ;;
+        esac
+        return
+    done
 }
 
 # ------------------------------------------------------------------------------
@@ -505,6 +588,7 @@ Commands:
   fullscreen | full    Capture an output (or all)
   ocr                  Select a region and OCR it to the clipboard
   scroll               Scrolling/long screenshot
+  settings             Open the settings menu (switch UI language, …)
 
 Options:
   -h, --help           Show this help
@@ -539,6 +623,7 @@ main() {
         fullscreen|full|output) mode_fullscreen ;;
         ocr)                mode_ocr ;;
         scroll|scrolling)   mode_scroll ;;
+        settings|config)    mode_settings ;;
         -h|--help|help)     usage ;;
         -v|--version)       printf '%s %s\n' "$APP_NAME" "$APP_VERSION" ;;
         --print-config)     print_config ;;

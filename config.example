@@ -14,6 +14,8 @@
 # DSP_MEM_DIR="$XDG_RUNTIME_DIR/dms-screenshot-plus"
 
 # --- UI language: auto | zh | en  (auto follows your locale) ----------------
+# Also switchable at runtime from the menu's "Settings" entry, which writes
+# your choice back here.
 # DSP_LANG="auto"
 
 # --- Menu renderer: auto | fuzzel | wofi | rofi | bemenu | fzf | term -------

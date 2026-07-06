@@ -121,13 +121,14 @@ Mod+Shift+F1  { spawn "dms-screenshot-plus" "scroll"; }
 ## Usage
 
 ```text
-dms-screenshot-plus [menu|region|fullscreen|ocr|scroll]
+dms-screenshot-plus [menu|region|fullscreen|ocr|scroll|settings]
 
   menu                 Show the picker (default)
   region               Select a region and capture
   fullscreen | full    Capture an output (or all outputs)
   ocr                  Select a region and OCR it to the clipboard
   scroll               Scrolling / long screenshot
+  settings             Open the settings menu (switch UI language, …)
 
   -h, --help           Show help
   -v, --version        Show version
@@ -149,7 +150,7 @@ cp config.example ~/.config/dms-screenshot-plus/config
 | -------------------- | ----------------------------------------- | ---------------------------------------- |
 | `DSP_SAVE_DIR`       | `<Pictures>/Screenshots`                  | Where *Save to disk* writes              |
 | `DSP_MEM_DIR`        | `$XDG_RUNTIME_DIR/dms-screenshot-plus`    | In-RAM staging dir                       |
-| `DSP_LANG`           | `auto`                                    | `auto` / `zh` / `en`                     |
+| `DSP_LANG`           | `auto`                                    | UI language `auto` / `zh` / `en` (also switchable in the **Settings** menu, which persists it here) |
 | `DSP_MENU_BACKEND`   | `auto`                                    | `fuzzel`/`wofi`/`rofi`/`bemenu`/`fzf`/`term` |
 | `DSP_FREEZE`         | `yes`                                     | Freeze screen during region select       |
 | `DSP_PLAY_SOUND`     | `yes`                                     | Shutter sound                            |
