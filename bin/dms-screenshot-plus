@@ -42,6 +42,12 @@ fi
 die() { notify "${1:-error}"; printf '%s: %s\n' "$APP_NAME" "${1:-error}" >&2; exit 1; }
 has() { command -v "$1" >/dev/null 2>&1; }
 
+# clip [wl-copy-args...] — pipe stdin to the Wayland clipboard.
+# Returns non-zero (without aborting) when no clipboard tool is installed, so
+# callers can degrade gracefully instead of dying under `set -e` / pipefail.
+# Only call it in a guarded context (if / || / after a has-wl-copy check).
+clip() { has wl-copy || return 1; wl-copy "$@"; }
+
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
@@ -135,6 +141,7 @@ msg() {
         n_copied_image)   zh="已复制图片";             en="Image copied" ;;
         n_copied_image_b) zh="可直接粘贴原图";         en="Paste the original image anywhere" ;;
         n_saved)          zh="已写入磁盘";             en="Saved to disk" ;;
+        n_no_clip)        zh="剪贴板不可用，已直接保存"; en="Clipboard unavailable — saved to disk instead" ;;
         n_canceled)       zh="已取消";                 en="Canceled" ;;
         n_failed)         zh="失败";                   en="Failed" ;;
         n_no_region)      zh="未选择区域";             en="No region selected" ;;
@@ -147,6 +154,8 @@ msg() {
         scroll_canceled)  zh="滚动截图已取消或失败";    en="Scrolling capture canceled or failed" ;;
         err_dep)          zh="缺少依赖：%s";           en="Missing dependency: %s" ;;
         err_no_grim)      zh="grim 截图失败";          en="grim failed to capture" ;;
+        err_no_menu)      zh="未找到菜单程序";          en="No menu program found" ;;
+        err_no_menu_b)    zh="请安装 fuzzel / wofi / rofi / bemenu"; en="Install fuzzel / wofi / rofi / bemenu" ;;
         menu_settings)    zh="设置";                   en="Settings" ;;
         title_settings)   zh="设置";                   en="Settings" ;;
         set_language)     zh="语言";                   en="Language" ;;
@@ -218,7 +227,7 @@ menu_pick() {
             if [[ $rc -eq 0 && "$idx" =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=${#items[@]} )); then
                 sel="${items[$((idx-1))]}"; rc=0
             else rc=130; fi ;;
-        none) return 130 ;;
+        none) notify "$(msg err_no_menu)" "$(msg err_no_menu_b)"; return 130 ;;
     esac
     [[ $rc -ne 0 || -z "${sel:-}" ]] && return 130
     printf '%s' "${sel//$'\r'/}"
@@ -260,6 +269,17 @@ freeze_stop() {
     rm -f "$_freeze_pidfile"
 }
 
+# Single cleanup path for every exit route: tear down the frozen overlay (a
+# leftover hyprpicker freezes the whole screen) and remove any temp OCR image.
+# Uses a file-scope var — not a function local — so it is still in scope when
+# the EXIT trap fires at the top level under `set -u`.
+# (Command-substitution subshells reset traps, so $(select_region) will NOT
+# fire this and unfreeze before grim gets to capture.)
+_ocr_tmp=""
+_cleanup() { freeze_stop; [[ -n "${_ocr_tmp:-}" ]] && rm -f "$_ocr_tmp" 2>/dev/null || true; }
+trap _cleanup EXIT
+trap 'exit 130' INT TERM
+
 # select_region [slurp-args...] -> prints geometry, returns 1 on cancel/Esc
 select_region() {
     has slurp || die "$(msg err_dep "slurp")"
@@ -295,7 +315,21 @@ post_capture_image() {
     [[ -s "$tmp" ]] || { notify "$(msg n_failed)" "$(msg err_no_grim)"; return 1; }
 
     play_shutter
-    printf '%s' "$tmp" | wl-copy   # path-first: clipboard is useful even if ignored
+
+    # No clipboard tool → the entire copy-centric action menu is meaningless.
+    # Persist the shot straight to disk and tell the user where it landed.
+    if ! has wl-copy; then
+        mkdir -p "$DSP_SAVE_DIR"
+        local nc_dest="$DSP_SAVE_DIR/$(basename "$tmp")"
+        if mv "$tmp" "$nc_dest"; then
+            notify -t 4000 -i "$nc_dest" "$(msg n_saved)" "$nc_dest"$'\n'"$(msg n_no_clip)"
+        else
+            notify "$(msg n_failed)" "$tmp"
+        fi
+        return 0
+    fi
+
+    printf '%s' "$tmp" | clip   # path-first: clipboard is useful even if ignored
 
     local action
     action="$(notify-send -a "$(msg app_title)" \
@@ -315,13 +349,13 @@ post_capture_image() {
         path)
             notify -t 2000 "$(msg n_copied_path)" "$tmp" ;;
         image)
-            wl-copy --type image/png < "$tmp"
+            clip --type image/png < "$tmp"
             notify -t 2000 -i "$tmp" "$(msg n_copied_image)" "$(msg n_copied_image_b)" ;;
         save)
             mkdir -p "$DSP_SAVE_DIR"
             dest="$DSP_SAVE_DIR/$base"
             mv "$tmp" "$dest"
-            printf '%s' "$dest" | wl-copy
+            printf '%s' "$dest" | clip
             notify -t 3000 -i "$dest" "$(msg n_saved)" "$dest" ;;
         dir)
             # Reveal-and-select via the freedesktop FileManager1 D-Bus API,
@@ -463,15 +497,18 @@ mode_ocr() {
     local geom img
     geom="$(select_region)" || { notify -t 2000 "$(msg n_canceled)" "$(msg n_no_region)"; exit 0; }
     img="$(mktemp "${TMPDIR:-/tmp}/dsp-ocr-XXXXXX.png")"
-    trap 'rm -f "$img"' EXIT
+    _ocr_tmp="$img"   # tracked by the global _cleanup EXIT trap
     grim -g "$geom" "$img" || { freeze_stop; notify "$(msg n_failed)" "$(msg err_no_grim)"; exit 1; }
     freeze_stop
 
     local text
     text="$(run_ocr "$img" | sed 's/[[:space:]]*$//' | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba}')"
     if [[ -n "$text" ]]; then
-        printf '%s' "$text" | wl-copy
-        notify "$(msg ocr_ok)" "$text"
+        if printf '%s' "$text" | clip; then
+            notify "$(msg ocr_ok)" "$text"
+        else
+            notify "$(msg ocr_title)" "$text"   # no clipboard: at least show it
+        fi
     else
         notify "$(msg ocr_title)" "$(msg ocr_empty)"
     fi
