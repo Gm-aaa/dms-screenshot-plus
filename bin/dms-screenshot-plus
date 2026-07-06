@@ -95,9 +95,20 @@ _default_pictures() {
 
 # Load the user config last-ish so it can override defaults but env still wins
 # for anything the user exported explicitly is handled by re-exporting below.
+DSP_CONFIG_ERR=""
 if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
+    # Validate syntax first so a stray typo can't abort startup, and source with
+    # errexit disabled so a failing command inside the (shell-sourced) config
+    # degrades to "ignore it" instead of killing the whole app. The user is told
+    # once, later, when notify/i18n are available (see main()).
+    if bash -n "$CONFIG_FILE" 2>/dev/null; then
+        set +e
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+        set -e
+    else
+        DSP_CONFIG_ERR="$CONFIG_FILE"
+    fi
 fi
 
 mkdir -p "$DSP_MEM_DIR"
@@ -142,6 +153,7 @@ msg() {
         n_copied_image_b) zh="可直接粘贴原图";         en="Paste the original image anywhere" ;;
         n_saved)          zh="已写入磁盘";             en="Saved to disk" ;;
         n_no_clip)        zh="剪贴板不可用，已直接保存"; en="Clipboard unavailable — saved to disk instead" ;;
+        err_config)       zh="配置文件有误，已忽略";     en="Config file invalid — ignored" ;;
         n_canceled)       zh="已取消";                 en="Canceled" ;;
         n_failed)         zh="失败";                   en="Failed" ;;
         n_no_region)      zh="未选择区域";             en="No region selected" ;;
@@ -319,9 +331,8 @@ post_capture_image() {
     # No clipboard tool → the entire copy-centric action menu is meaningless.
     # Persist the shot straight to disk and tell the user where it landed.
     if ! has wl-copy; then
-        mkdir -p "$DSP_SAVE_DIR"
         local nc_dest="$DSP_SAVE_DIR/$(basename "$tmp")"
-        if mv "$tmp" "$nc_dest"; then
+        if mkdir -p "$DSP_SAVE_DIR" 2>/dev/null && mv "$tmp" "$nc_dest"; then
             notify -t 4000 -i "$nc_dest" "$(msg n_saved)" "$nc_dest"$'\n'"$(msg n_no_clip)"
         else
             notify "$(msg n_failed)" "$tmp"
@@ -352,11 +363,13 @@ post_capture_image() {
             clip --type image/png < "$tmp"
             notify -t 2000 -i "$tmp" "$(msg n_copied_image)" "$(msg n_copied_image_b)" ;;
         save)
-            mkdir -p "$DSP_SAVE_DIR"
             dest="$DSP_SAVE_DIR/$base"
-            mv "$tmp" "$dest"
-            printf '%s' "$dest" | clip
-            notify -t 3000 -i "$dest" "$(msg n_saved)" "$dest" ;;
+            if mkdir -p "$DSP_SAVE_DIR" 2>/dev/null && mv "$tmp" "$dest"; then
+                printf '%s' "$dest" | clip
+                notify -t 3000 -i "$dest" "$(msg n_saved)" "$dest"
+            else
+                notify "$(msg n_failed)" "$dest"
+            fi ;;
         dir)
             # Reveal-and-select via the freedesktop FileManager1 D-Bus API,
             # falling back to just opening the containing folder.
@@ -366,17 +379,21 @@ post_capture_image() {
                 "['file://$tmp']" "" >/dev/null 2>&1 \
                 || gio open "$(dirname "$tmp")" >/dev/null 2>&1; } & ;;
         edit)
+            local ed="${DSP_EDITOR_CMD%% *}"
+            if ! has "$ed"; then notify "$(msg n_failed)" "$(msg err_dep "$ed")"; return 1; fi
             mkdir -p "$DSP_SAVE_DIR"
             # shellcheck disable=SC2086
             $DSP_EDITOR_CMD --filename "$tmp" \
                 --output-filename "$DSP_SAVE_DIR/$ts-edited.png" \
                 --copy-command wl-copy >/dev/null 2>&1 & ;;
         pin)
+            local vw="${DSP_IMAGE_VIEWER%% *}"
+            if ! has "$vw"; then notify "$(msg n_failed)" "$(msg err_dep "$vw")"; return 1; fi
             # Copy out of the auto-cleared mem dir so the next shot won't delete it.
             local pindir="$DSP_MEM_DIR/pinned" pinimg
             mkdir -p "$pindir"
             pinimg="$pindir/pinned-shot-$ts.png"
-            cp "$tmp" "$pinimg"
+            if ! cp "$tmp" "$pinimg"; then notify "$(msg n_failed)" "$tmp"; return 1; fi
             # shellcheck disable=SC2086
             $DSP_IMAGE_VIEWER "$pinimg" >/dev/null 2>&1 & ;;
         *) : ;;  # dismissed / timed out: path already on clipboard
@@ -654,6 +671,7 @@ print_config() {
 }
 
 main() {
+    [[ -n "${DSP_CONFIG_ERR:-}" ]] && notify "$(msg err_config)" "$DSP_CONFIG_ERR"
     case "${1:-menu}" in
         menu|"")            show_menu ;;
         region|area)        mode_region ;;
