@@ -183,6 +183,11 @@ msg() {
         kb_paste)         zh="贴到 %s";                 en="Paste into %s" ;;
         kb_niri_hint)     zh="（放进 binds { } 块内）";  en="(inside the binds { } block)" ;;
         kb_generic_target) zh="你的合成器配置文件";      en="your compositor config file" ;;
+        kb_already)       zh="快捷键已绑定";            en="Keybinding already set" ;;
+        kb_do_write)      zh="写入 %s（备份 .bak）";     en="Write to %s (backup .bak)" ;;
+        kb_do_copy)       zh="只复制片段";              en="Just copy the snippet" ;;
+        kb_written)       zh="已写入配置 (%s)";         en="Written to config (%s)" ;;
+        kb_backup)        zh="备份：%s";                en="Backup: %s" ;;
         *)                zh="$k";                     en="$k" ;;
     esac
     local tmpl; [[ "$DSP_UI_LANG" == zh ]] && tmpl="$zh" || tmpl="$en"
@@ -626,14 +631,28 @@ _keybind_self() {
     printf '%s' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 }
 
-# settings_keybind — detect the running compositor, build the matching keybind
-# snippet (default Mod+F1), copy it to the clipboard and show it. Never edits
-# any config file — the user pastes it where they want.
+# _keybind_copy <comp-label> <snippet> <target> — copy snippet to the clipboard
+# and show it (the non-invasive fallback path). With no clipboard tool the
+# snippet is still shown in the notification body.
+_keybind_copy() {
+    local comp="$1" snippet="$2" target="$3"
+    local body="$snippet"$'\n\n'"$(msg kb_paste "$target")"
+    if printf '%s' "$snippet" | clip; then
+        notify -t 6000 "$(msg kb_copied "$comp")" "$body"
+    else
+        notify -t 8000 "$(msg kb_shown "$comp")" "$body"
+    fi
+}
+
+# settings_keybind — detect the running compositor, then offer to write a
+# default Mod+F1 bind into its config (with a .bak backup) or just copy the
+# snippet. niri binds go *inside* the first `binds { }` block (niri hot-reloads
+# on save); hyprland/sway append a line and reload. Anything it can't edit
+# safely (unknown compositor, missing config, no niri binds block) falls back
+# to copy. Idempotent: an existing bind for this command is left alone.
 settings_keybind() {
-    local self comp snippet target
+    local self comp cfg snippet reloadcmd target
     self="$(_keybind_self)"
-    # Detect the *running* compositor from its env socket — more reliable than
-    # checking whether a binary happens to be installed.
     if   [[ -n "${NIRI_SOCKET:-}" ]];                 then comp=niri
     elif [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then comp=hyprland
     elif [[ -n "${SWAYSOCK:-}" ]];                    then comp=sway
@@ -641,26 +660,66 @@ settings_keybind() {
 
     case "$comp" in
         niri)
+            cfg="$XDG_CONFIG_HOME/niri/config.kdl"
             snippet="Mod+F1 hotkey-overlay-title=\"$(msg app_title)\" { spawn \"$self\"; }"
-            target="~/.config/niri/config.kdl $(msg kb_niri_hint)" ;;
+            reloadcmd=""    # niri watches the file and reloads automatically
+            target="~/.config/niri/config.kdl" ;;
         hyprland)
+            cfg="$XDG_CONFIG_HOME/hypr/hyprland.conf"
             snippet="bind = SUPER, F1, exec, $self"
+            reloadcmd="hyprctl reload"
             target="~/.config/hypr/hyprland.conf" ;;
         sway)
+            cfg="$XDG_CONFIG_HOME/sway/config"
             snippet="bindsym \$mod+F1 exec $self"
+            reloadcmd="swaymsg reload"
             target="~/.config/sway/config" ;;
-        *)
-            comp="niri / hyprland / sway"
-            snippet="# niri:"$'\n'"Mod+F1 { spawn \"$self\"; }"$'\n'"# hyprland:"$'\n'"bind = SUPER, F1, exec, $self"$'\n'"# sway:"$'\n'"bindsym \$mod+F1 exec $self"
-            target="$(msg kb_generic_target)" ;;
+        *)  # Unknown compositor — copy an all-in-one snippet, can't safely edit.
+            local gen="# niri:"$'\n'"Mod+F1 { spawn \"$self\"; }"$'\n'"# hyprland:"$'\n'"bind = SUPER, F1, exec, $self"$'\n'"# sway:"$'\n'"bindsym \$mod+F1 exec $self"
+            _keybind_copy "niri / hyprland / sway" "$gen" "$(msg kb_generic_target)"
+            return 0 ;;
     esac
 
-    local body="$snippet"$'\n\n'"$(msg kb_paste "$target")"
-    if printf '%s' "$snippet" | clip; then
-        notify -t 6000 "$(msg kb_copied "$comp")" "$body"
-    else
-        notify -t 8000 "$(msg kb_shown "$comp")" "$body"
+    # Already bound to this command? Leave it alone.
+    if [[ -f "$cfg" ]] && grep -qF "$self" "$cfg" 2>/dev/null; then
+        notify -t 3000 "$(msg kb_already)" "$target"
+        return 0
     fi
+
+    # Ask before touching a config file.
+    local A_WRITE A_COPY pick
+    A_WRITE="$(msg kb_do_write "$target")"
+    A_COPY="$(msg kb_do_copy)"
+    pick="$(menu_pick "$(msg set_keybind)" "$A_WRITE" "$A_COPY" "$(msg set_back)")" || return 0
+    case "$pick" in
+        "$A_COPY") _keybind_copy "$comp" "$snippet" "$target"; return 0 ;;
+        "$A_WRITE") : ;;                 # fall through to the write path
+        *)         return 0 ;;
+    esac
+
+    # Fall back to copy when we can't edit safely.
+    if [[ ! -f "$cfg" ]] \
+       || { [[ "$comp" == niri ]] && ! grep -qE '^[[:space:]]*binds[[:space:]]*\{' "$cfg"; }; then
+        _keybind_copy "$comp" "$snippet" "$target"; return 0
+    fi
+
+    cp -f "$cfg" "$cfg.bak" 2>/dev/null || { notify "$(msg n_failed)" "$cfg"; return 1; }
+    local tmp; tmp="$(mktemp "${cfg%/*}/.kb.XXXXXX")" || { notify "$(msg n_failed)" "$cfg"; return 1; }
+    if [[ "$comp" == niri ]]; then
+        # Insert (indented) right after the first `binds {`.
+        awk -v ins="    $snippet" '
+            !done && $0 ~ /^[[:space:]]*binds[[:space:]]*\{/ { print; print ins; done=1; next }
+            { print }
+        ' "$cfg" > "$tmp"
+    else
+        cat "$cfg" > "$tmp"; printf '%s\n' "$snippet" >> "$tmp"
+    fi
+    if ! mv "$tmp" "$cfg"; then rm -f "$tmp"; notify "$(msg n_failed)" "$cfg"; return 1; fi
+
+    # niri auto-reloads; hyprland/sway need a nudge.
+    # shellcheck disable=SC2086
+    [[ -n "$reloadcmd" ]] && $reloadcmd >/dev/null 2>&1 || true
+    notify -t 5000 "$(msg kb_written "$comp")" "$target"$'\n'"$(msg kb_backup "$cfg.bak")"
 }
 
 # mode_settings — settings submenu; loops until Back/cancel.
