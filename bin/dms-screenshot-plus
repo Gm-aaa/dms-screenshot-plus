@@ -270,7 +270,9 @@ list_outputs() {
 # The freeze layer's PID is tracked through a file, not a shell variable:
 # select_region() runs inside a command substitution (a subshell), so a
 # variable set there never reaches the caller's freeze_stop. A file does.
-_freeze_pidfile="$DSP_MEM_DIR/.freeze.pid"
+# The file is per-process ($$) so two concurrent invocations (e.g. the hotkey
+# fired twice) don't clobber each other's freeze PID.
+_freeze_pidfile="$DSP_MEM_DIR/.freeze.$$.pid"
 freeze_start() {
     [[ "${DSP_FREEZE,,}" == yes ]] || return 0
     has hyprpicker || return 0
@@ -314,14 +316,27 @@ select_region() {
 play_shutter() {
     [[ "${DSP_PLAY_SOUND,,}" == yes ]] || return 0
     [[ -r "$DSP_SHUTTER_SOUND" ]] || return 0
-    has pw-play && pw-play "$DSP_SHUTTER_SOUND" >/dev/null 2>&1 &
+    # Try players in order of preference; use the first one installed. pw-play
+    # (PipeWire) and paplay (PulseAudio) both read .oga via libsndfile; ffplay
+    # handles anything; aplay is a last-resort WAV fallback.
+    local p
+    for p in pw-play paplay ffplay aplay; do
+        has "$p" || continue
+        case "$p" in
+            ffplay) ffplay -nodisp -autoexit -loglevel quiet "$DSP_SHUTTER_SOUND" >/dev/null 2>&1 & ;;
+            *)      "$p" "$DSP_SHUTTER_SOUND" >/dev/null 2>&1 & ;;
+        esac
+        break
+    done
     return 0
 }
 
 new_tmp_png() {
-    # Keep only the latest in-RAM shot; clear stragglers from the last run.
-    rm -f "$DSP_MEM_DIR"/*.png 2>/dev/null || true
-    printf '%s' "$DSP_MEM_DIR/$(date +"$DSP_FILENAME_FMT").png"
+    # Reap only *stale* in-RAM shots (>1h), never a concurrent run's in-flight
+    # capture, then hand back a per-process unique path so two quick invocations
+    # can't collide on the same filename.
+    find "$DSP_MEM_DIR" -maxdepth 1 -name '*.png' -mmin +60 -delete 2>/dev/null || true
+    printf '%s' "$DSP_MEM_DIR/$(date +"$DSP_FILENAME_FMT")-$$.png"
 }
 
 # ------------------------------------------------------------------------------
@@ -713,6 +728,7 @@ Commands:
   ocr                  Select a region and OCR it to the clipboard
   scroll               Scrolling/long screenshot
   settings             Open the settings menu (switch UI language, …)
+  doctor               Check dependencies and what each one unlocks
 
 Options:
   -h, --help           Show this help
@@ -740,6 +756,43 @@ print_config() {
     printf '%-22s = %s\n' "(OCR backend)" "$(detect_ocr_backend)"
 }
 
+# doctor — one-shot preflight: report which tools are present and what each
+# unlocks, so missing pieces are visible up front instead of only when used.
+doctor() {
+    local mb ocb
+    # Note: these helpers run inside $(...) subshells, so they can only PRINT —
+    # a variable set here would not survive to the parent. The overall exit code
+    # is therefore computed independently at the end, not accumulated here.
+    _mk()  { if has "$1"; then printf '\033[32m✓\033[0m'; else printf '\033[31m✗\033[0m'; fi; }
+    _yn()  { if [[ "$1" == "$2" ]]; then printf '\033[31m✗\033[0m'; else printf '\033[32m✓\033[0m'; fi; }
+    _row() { printf '  %b  %-16s %s\n' "$1" "$2" "$3"; }
+
+    printf '%s %s — dependency check\n\n' "$APP_NAME" "$APP_VERSION"
+    printf 'Core (required):\n'
+    _row "$(_mk grim)"        grim        "capture screenshots"
+    _row "$(_mk slurp)"       slurp       "region / OCR selection"
+    _row "$(_mk wl-copy)"     wl-copy     "clipboard (else auto-save to disk)"
+    _row "$(_mk notify-send)" notify-send "notifications & the action menu"
+
+    printf '\nMenu backend:\n'
+    mb="$(_pick_menu_backend)"
+    _row "$(_yn "$mb" none)" "$mb" "picker (fuzzel/wofi/rofi/bemenu/fzf/term)"
+
+    printf '\nOptional (feature → tool):\n'
+    _row "$(_mk hyprpicker)"                  hyprpicker                "freeze screen while selecting"
+    _row "$(_mk "${DSP_EDITOR_CMD%% *}")"     "${DSP_EDITOR_CMD%% *}"   "annotate (edit action)"
+    _row "$(_mk "${DSP_IMAGE_VIEWER%% *}")"   "${DSP_IMAGE_VIEWER%% *}" "pin on top"
+    _row "$(_mk "${DSP_SCROLL_CMD%% *}")"     "${DSP_SCROLL_CMD%% *}"   "scrolling capture"
+    ocb="$(detect_ocr_backend)"
+    _row "$(_yn "$ocb" none)" "$ocb" "OCR backend"
+    _row "$(_mk jq)"          jq          "robust multi-output enumeration"
+
+    printf '\nRun '\''%s --print-config'\'' to see the resolved configuration.\n' "$APP_NAME"
+    # Non-zero only when something *core* is missing (a missing optional tool
+    # merely degrades a feature, so it doesn't fail the check).
+    has grim && has slurp && has wl-copy && has notify-send && [[ "$mb" != none ]]
+}
+
 main() {
     [[ -n "${DSP_CONFIG_ERR:-}" ]] && notify "$(msg err_config)" "$DSP_CONFIG_ERR"
     case "${1:-menu}" in
@@ -752,6 +805,7 @@ main() {
         -h|--help|help)     usage ;;
         -v|--version)       printf '%s %s\n' "$APP_NAME" "$APP_VERSION" ;;
         --print-config)     print_config ;;
+        doctor|check)       doctor ;;
         *) usage >&2; exit 2 ;;
     esac
 }
