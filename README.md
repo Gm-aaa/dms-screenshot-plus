@@ -18,13 +18,19 @@ single notification that lets you decide what to do with each shot.
   you ask it to. Nothing leaks to `~/Pictures` unless you pick *Save*.
 - **One capture, six choices** — each shot raises a notification with:
   *copy path · copy image · save to disk · open folder · annotate · pin on top*.
-  If you ignore it, the file path is already on your clipboard.
+  If you ignore it, the file path is already on your clipboard — and if no
+  clipboard tool is installed, the shot is saved to disk automatically.
 - **Frozen-screen selection** — the screen is frozen (via `hyprpicker`) while you
   drag a region, so fast-moving content stays put.
 - **Pluggable OCR** — auto-detects [RapidOCR](https://github.com/RapidAI/RapidOCR)
   or `tesseract`, or plug in any command via `DSP_OCR_CMD`.
 - **Compositor-agnostic** — output enumeration works on niri, Hyprland, Sway and
   generic wlroots (`wlr-randr`).
+- **Set your shortcut from the menu** — *Settings → Keybinding* detects your
+  compositor and writes a `Mod+F1` bind into its config (backing it up first),
+  or just copies the snippet.
+- **Self-check** — `dms-screenshot-plus doctor` reports what's installed and what
+  each tool unlocks.
 - **Bilingual UI** — Chinese / English, auto-selected from your locale.
 - **Zero hardcoded paths** — everything is XDG-based, with a config file and
   environment-variable overrides.
@@ -35,6 +41,9 @@ This is a pure-Bash tool — no compilation, no runtime besides the binaries it
 shells out to. Only the **core** set is mandatory; everything else unlocks one
 specific feature and degrades gracefully when absent (the mode tells you what it
 needs instead of crashing).
+
+> **Tip:** run `dms-screenshot-plus doctor` to see, at a glance, which tools are
+> present (✓/✗) and what each one unlocks.
 
 ### Core (required)
 
@@ -48,7 +57,7 @@ or a numbered prompt.
 | Feature             | Needs                                                              |
 | ------------------- | ----------------------------------------------------------------- |
 | Frozen selection    | `hyprpicker`                                                      |
-| Shutter sound       | `pipewire` (`pw-play`)                                            |
+| Shutter sound       | `pw-play` / `paplay` / `ffplay` / `aplay` (first one found)        |
 | Multi-output picker | `jq` + your compositor's CLI (`niri` / `hyprctl` / `swaymsg`)      |
 | **OCR**             | A RapidOCR venv **or** `tesseract` — see [OCR backends & models](#ocr-backends--models) |
 | Scrolling capture   | [`wayscrollshot`](https://github.com/ChrisCDeloye/wayscrollshot) (configurable via `DSP_SCROLL_CMD`) |
@@ -99,6 +108,13 @@ and uninstall with `./install.sh uninstall`.
 
 Then bind a key.
 
+**The easy way — from inside the app.** Launch it once (e.g. `dms-screenshot-plus`
+from a terminal), open *Settings → Keybinding*, and it will detect your
+compositor and offer to write a `Mod+F1` bind into its config for you — backing
+the file up to `<config>.bak` first, and reloading where needed (niri hot-reloads
+on its own). Prefer to do it yourself? It can just copy the snippet instead. Use
+the manual route below if you want a different key or a bind straight to one mode.
+
 **niri** (`~/.config/niri/.../binds.kdl`):
 
 ```kdl
@@ -121,14 +137,15 @@ Mod+Shift+F1  { spawn "dms-screenshot-plus" "scroll"; }
 ## Usage
 
 ```text
-dms-screenshot-plus [menu|region|fullscreen|ocr|scroll|settings]
+dms-screenshot-plus [menu|region|fullscreen|ocr|scroll|settings|doctor]
 
   menu                 Show the picker (default)
   region               Select a region and capture
   fullscreen | full    Capture an output (or all outputs)
   ocr                  Select a region and OCR it to the clipboard
   scroll               Scrolling / long screenshot
-  settings             Open the settings menu (switch UI language, …)
+  settings             Open the settings menu (UI language, keybinding)
+  doctor               Check dependencies and what each one unlocks
 
   -h, --help           Show help
   -v, --version        Show version
@@ -258,12 +275,27 @@ DSP_OCR_CMD="my-ocr-wrapper --stdout" dms-screenshot-plus ocr
 
 ## How it works
 
-1. A capture is written to `DSP_MEM_DIR` (tmpfs). Only the newest shot is kept.
+1. A capture is written to `DSP_MEM_DIR` (tmpfs) under a per-run filename, so
+   firing the hotkey twice never clobbers an in-flight shot; stale shots (older
+   than an hour) are reaped on the next run.
 2. The path is placed on the clipboard immediately.
 3. A notification offers six actions; your choice may overwrite the clipboard
    (image bytes), move the file to `DSP_SAVE_DIR`, open it, annotate it, or pin
    it on top.
 4. OCR is a separate flow: it recognises text and copies the **text** instead.
+
+## Troubleshooting
+
+- **`dms-screenshot-plus doctor`** prints a ✓/✗ report of every dependency and
+  what it unlocks, plus the resolved menu and OCR backends. It exits non-zero
+  when a *core* tool is missing.
+- **Nothing happens when I press the key.** Usually no menu backend is installed
+  — `doctor` will flag it; install `fuzzel` (or `wofi`/`rofi`/`bemenu`).
+- **OCR found no text.** Re-run with `DSP_DEBUG=1 dms-screenshot-plus ocr` and
+  read `$XDG_RUNTIME_DIR/dms-screenshot-plus.log`. A traceback there (and an
+  *"OCR engine error"* notification) means the engine crashed; an *"No text
+  recognised"* notification with an empty log means it ran but read nothing in
+  that region.
 
 ## License
 

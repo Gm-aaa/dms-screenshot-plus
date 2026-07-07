@@ -31,13 +31,18 @@ esac
 
 cat <<'EOF'
 
-Done. Suggested niri keybind (~/.config/niri/.../binds.kdl):
+Done. Bind a key the easy way: run `dms-screenshot-plus`, then
+Settings -> Keybinding — it writes a Mod+F1 bind into your compositor's
+config (with a .bak backup) or copies the snippet.
 
+Prefer to do it by hand?
+
+  niri (~/.config/niri/.../binds.kdl):
     Mod+F1 hotkey-overlay-title="截图菜单 Screenshot menu" { spawn "dms-screenshot-plus"; }
 
-Hyprland (hyprland.conf):
-
+  Hyprland (hyprland.conf):
     bind = SUPER, F1, exec, dms-screenshot-plus
 
+Check your setup any time with:  dms-screenshot-plus doctor
 Optional: copy config.example to ~/.config/dms-screenshot-plus/config to tweak defaults.
 EOF
