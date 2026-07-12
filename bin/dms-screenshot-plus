@@ -198,15 +198,39 @@ msg() {
 # ------------------------------------------------------------------------------
 # Notifications
 # ------------------------------------------------------------------------------
+# glib-based notify-send converts *option* arguments (-a app name, -A action
+# labels) from the locale charset to UTF-8. Under a broken session locale
+# (e.g. LANG pointing at a locale that was never generated, so glibc falls
+# back to C/ASCII) every non-ASCII label makes notify-send exit 1 with
+# "Invalid byte sequence in conversion input" and the notification is
+# silently lost. All strings in this script are UTF-8 by construction, so
+# when the effective charset is not UTF-8 we pin a known-good UTF-8 locale
+# for the notify-send invocation only (session locale is left untouched).
+_NSEND=(notify-send)
+_init_notify_locale() {
+    local cm cand
+    cm="$(locale charmap 2>/dev/null || true)"
+    [[ "${cm^^}" == UTF*8 ]] && return 0
+    for cand in C.UTF-8 en_US.UTF-8; do
+        cm="$(LC_ALL="$cand" locale charmap 2>/dev/null || true)"
+        [[ "${cm^^}" == UTF*8 ]] && { _NSEND=(env "LC_ALL=$cand" notify-send); return 0; }
+    done
+    # No UTF-8 locale exists on this system at all: force the English UI so
+    # everything we hand to notify-send is plain ASCII and survives the
+    # C-charset conversion instead of being dropped.
+    DSP_UI_LANG=en
+}
+_init_notify_locale
+
 notify() {
     has notify-send || return 0
     local timeout="$DSP_NOTIFY_TIMEOUT" icon=""
     [[ "${1:-}" == "-t" ]] && { timeout="$2"; shift 2; }
     [[ "${1:-}" == "-i" ]] && { icon="$2"; shift 2; }
     if [[ -n "$icon" ]]; then
-        notify-send -a "$(msg app_title)" -t "$timeout" -i "$icon" "$1" "${2:-}"
+        "${_NSEND[@]}" -a "$(msg app_title)" -t "$timeout" -i "$icon" "$1" "${2:-}"
     else
-        notify-send -a "$(msg app_title)" -t "$timeout" "$1" "${2:-}"
+        "${_NSEND[@]}" -a "$(msg app_title)" -t "$timeout" "$1" "${2:-}"
     fi
 }
 
@@ -370,7 +394,7 @@ post_capture_image() {
     printf '%s' "$tmp" | clip   # path-first: clipboard is useful even if ignored
 
     local action
-    action="$(notify-send -a "$(msg app_title)" \
+    action="$("${_NSEND[@]}" -a "$(msg app_title)" \
         -i "$tmp" \
         -A "path=$(msg act_copy_path)" \
         -A "image=$(msg act_copy_image)" \
@@ -832,6 +856,16 @@ doctor() {
     _row "$(_mk slurp)"       slurp       "region / OCR selection"
     _row "$(_mk wl-copy)"     wl-copy     "clipboard (else auto-save to disk)"
     _row "$(_mk notify-send)" notify-send "notifications & the action menu"
+
+    printf '\nLocale:\n'
+    local _cm; _cm="$(locale charmap 2>/dev/null || true)"
+    if [[ "${_cm^^}" == UTF*8 ]]; then
+        _row "$(printf '\033[32m✓\033[0m')" "${_cm}" "session charset (notifications sent as-is)"
+    elif [[ "${#_NSEND[@]}" -gt 1 ]]; then
+        _row "$(printf '\033[33m!\033[0m')" "${_cm:-unknown}" "non-UTF-8 session — notify-send pinned to ${_NSEND[1]#LC_ALL=}"
+    else
+        _row "$(printf '\033[33m!\033[0m')" "${_cm:-unknown}" "no UTF-8 locale on system — UI forced to ASCII English"
+    fi
 
     printf '\nMenu backend:\n'
     mb="$(_pick_menu_backend)"
